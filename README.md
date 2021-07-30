@@ -10,7 +10,7 @@ The actual snapshot uploading is done using [coldsnap](https://github.com/awslab
 ### Status
 
 At the time of writing, this is neither heavily tested, nor all that clean
-code. Use at your own risk.
+code. Caveat emptor.
 
 ## License
 
