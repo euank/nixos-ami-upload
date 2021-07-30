@@ -1,0 +1,23 @@
+[package]
+name = "nixos-ami-upload"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.40"
+clap = "2.33.3"
+coldsnap = "0.3.1"
+env_logger = "0.8.3"
+gpt = "2.0.0"
+log = "0.4.14"
+rusoto_core = "0.46.0"
+rusoto_credential = "0.46.0"
+rusoto_ebs = "0.46.0"
+rusoto_ec2 = "0.46.0"
+rusoto_ssm = "0.46.0"
+serde = "1.0.126"
+serde_json = "1.0.64"
+snafu = "0.6.10"
+tokio = "1.6.1"
