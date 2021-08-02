@@ -190,6 +190,8 @@ async fn main_() -> Result<()> {
         .register_image(rusoto_ec2::RegisterImageRequest {
             name: ami_name.clone(),
             architecture: Some("x86_64".to_string()),
+            ena_support: Some(true),
+            virtualization_type: Some("hvm".to_string()),
             description: Some(format!("NixOS {} {}", info.label, info.system)),
             root_device_name: Some("/dev/xvda".to_string()),
             block_device_mappings: Some(vec![
