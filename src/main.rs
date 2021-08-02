@@ -8,13 +8,13 @@ use core::str::FromStr;
 use std::path::PathBuf;
 
 use anyhow::{ensure, format_err, Context, Result};
-use clap::{App, Arg};
 use coldsnap::{SnapshotUploader, SnapshotWaiter};
 use log::debug;
 use rusoto_ebs::EbsClient;
 use rusoto_ec2::{Ec2, Ec2Client};
 use rusoto_ssm::{GetParametersByPathRequest, Ssm, SsmClient};
 use serde::Deserialize;
+use structopt::StructOpt;
 
 // ImageInfo is metadata provided by the nix image build scripts.
 // https://github.com/NixOS/nixpkgs/blob/bed52081e58807a23fcb2df38a3f865a2f37834e/nixos/maintainers/scripts/ec2/amazon-image.nix#L86-L92
@@ -25,6 +25,30 @@ struct ImageInfo {
     #[serde(deserialize_with = "de_string_to_u64")]
     logical_bytes: u64,
     file: PathBuf,
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "nixos-ami-upload")]
+struct Opt {
+    // print debug information to stderr
+    #[structopt(long)]
+    debug: bool,
+    // regions to copy the AMI to, or 'all' for all of them.
+    #[structopt(long, default_value = "all")]
+    regions: Vec<String>,
+    // the root size of the AMI's ebs volume, in GBs. By default, this will be the same as the
+    // image's size
+    #[structopt(long)]
+    root_size: Option<u64>,
+
+    // the output format, one of 'json' or 'nix'
+    // AMIs in each region will be printed in this format to stdout on success.
+    #[structopt(long, default_value = "json")]
+    output_format: String,
+
+    // directory containing nixos ami and metadata
+    #[structopt(name = "file")]
+    ami_dir: String,
 }
 
 // Converts a string with a number in it to a u64
@@ -49,45 +73,15 @@ async fn main() {
 }
 
 async fn main_() -> Result<()> {
-    let args = App::new("nixos-ami-upload")
-        .about("Upload NixOS AMIs to one or more regions")
-        .version(clap::crate_version!())
-        .author(clap::crate_authors!())
-        .arg(
-            Arg::with_name("debug")
-                .help("print debug information to stderr")
-                .long("debug")
-        )
-        .arg(
-            Arg::with_name("regions")
-                .help("list of regions to upload to")
-                .takes_value(true)
-                .multiple(true)
-                .default_value("all")
-                .long("regions")
-        )
-        .arg(
-            Arg::with_name("root-size")
-                .help("root size of the EBS volume")
-                .takes_value(true)
-                .long("root-size")
-        )
-        .arg(
-            Arg::with_name("nixos ami directory")
-                .help("the path to a nixos 'amazonImage' directory containing 'nix-support/image-info.json'")
-                .required(true)
-        )
-        .get_matches();
+    let args = Opt::from_args();
 
-    if args.is_present("debug") {
+    if args.debug {
         env_logger::Builder::new()
             .filter(None, log::LevelFilter::Debug)
             .try_init()?;
     }
 
-    let dir = args
-        .value_of("nixos ami directory")
-        .context("must provide image directory")?;
+    let dir = args.ami_dir;
     let image_info_path = PathBuf::from(dir)
         .join("nix-support")
         .join("image-info.json");
@@ -120,7 +114,7 @@ async fn main_() -> Result<()> {
     })?;
 
     // now for regions
-    let region_strs: Vec<_> = args.values_of("regions").unwrap().collect();
+    let region_strs = args.regions;
     ensure!(
         !region_strs.is_empty(),
         "must specify one or more regions, or use the default of 'all'"
@@ -136,7 +130,7 @@ async fn main_() -> Result<()> {
         let rs = region_strs
             .into_iter()
             .map(|r| {
-                rusoto_core::region::Region::from_str(r).with_context(|| "could not parse region")
+                rusoto_core::region::Region::from_str(&r).with_context(|| "could not parse region")
             })
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("failed to parse region"))?;
@@ -151,14 +145,13 @@ async fn main_() -> Result<()> {
         .collect();
 
     // upload time
-    debug!("performing initial snapshot upload to {:?}", initial_region);
+    eprintln!("uploading snapshot to region {}", initial_region.name());
 
     let ebs_client = EbsClient::new(initial_region.clone());
     let uploader = SnapshotUploader::new(ebs_client);
     let snapshot_id = uploader
         .upload_from_file(&image, None, Some(&info.label), None)
         .await?;
-    println!("uploading snapshot {}", snapshot_id);
 
     let ec2_client = Ec2Client::new(initial_region.clone());
     SnapshotWaiter::new(ec2_client)
@@ -166,8 +159,8 @@ async fn main_() -> Result<()> {
         .await?;
 
     // Snapshot done, make the AMI
-    let ami_gbs = match args.value_of("root_size") {
-        Some(s) => s.parse().context("invalid root-size")?,
+    let ami_gbs = match args.root_size {
+        Some(s) => s,
         None => {
             // bytes to gbs, but round up
             let bytes_in_gb = 1024 * 1024 * 1024;
@@ -223,7 +216,7 @@ async fn main_() -> Result<()> {
         .expect("could not register ami");
     let init_ami_id = resp.image_id.unwrap();
 
-    println!(
+    eprintln!(
         "registered ami: region={},id={}",
         initial_region.name(),
         init_ami_id
@@ -240,7 +233,7 @@ async fn main_() -> Result<()> {
             })
             .await
             .expect("could not copy ami to region");
-        println!(
+        eprintln!(
             "copied ami to region {} as id {}",
             region.name(),
             resp.image_id.unwrap()
