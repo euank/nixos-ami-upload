@@ -14,7 +14,7 @@ use rusoto_ebs::EbsClient;
 use rusoto_ec2::{Ec2, Ec2Client};
 use rusoto_ssm::{Ssm, SsmClient, GetParametersByPathRequest};
 use serde::Deserialize;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure, format_err};
 
 // ImageInfo is metadata provided by the nix image build scripts.
 // https://github.com/NixOS/nixpkgs/blob/bed52081e58807a23fcb2df38a3f865a2f37834e/nixos/maintainers/scripts/ec2/amazon-image.nix#L86-L92
@@ -34,6 +34,16 @@ fn de_string_to_u64<'de, D>(d: D) -> Result<u64, D::Error> where D: serde::Deser
 
 #[tokio::main]
 async fn main() {
+    match main_().await {
+        Err(e) => {
+            eprintln!("{:?}", e);
+            std::process::exit(1);
+        }
+        Ok(_) => {},
+    }
+}
+
+async fn main_() -> Result<()> {
     let args = App::new("nixos-ami-upload")
         .about("Upload NixOS AMIs to one or more regions")
         .version(clap::crate_version!())
@@ -67,55 +77,46 @@ async fn main() {
     if args.is_present("debug") {
         env_logger::Builder::new()
             .filter(None, log::LevelFilter::Debug)
-            .try_init()
-            .unwrap();
+            .try_init()?;
     }
 
-    let dir = args.value_of("nixos ami directory").unwrap();
+    let dir = args.value_of("nixos ami directory").context("must provide image directory")?;
     let image_info_path = PathBuf::from(dir).join("nix-support").join("image-info.json");
 
-    let f: std::fs::File = std::fs::File::open(image_info_path).unwrap();
+    let f: std::fs::File = std::fs::File::open(&image_info_path)
+        .with_context(|| format!("malformed image directory, could not open {:?}", &image_info_path))?;
 
-    let info: ImageInfo = serde_json::from_reader(f).unwrap();
+    let info: ImageInfo = serde_json::from_reader(f)
+        .context("error parsing image-info.json")?;
 
     debug!("read image info: {:?}", info);
 
     // validation, make sure the image file exists and is probably a raw image
-    if info.system != "x86_64-linux" {
-        println!("unsupported system '{}'; only x86_64-linux is supported", info.system);
-        std::process::exit(1);
-    }
+    ensure!(
+        info.system == "x86_64-linux",
+        "unsupported system '{}'; only x86_64-linux is supported", info.system,
+    );
     let image = PathBuf::from(info.file);
 
-    match gpt::header::read_header(&image, gpt::disk::DEFAULT_SECTOR_SIZE) {
-        Err(e) => {
-            println!("could not read disk header for disk '{}'. Image must be a valid raw disk image: {}", image.to_string_lossy(), e);
-            std::process::exit(1);
-        },
-        Ok(_) => {},
-    };
+    gpt::header::read_header(&image, gpt::disk::DEFAULT_SECTOR_SIZE)
+        .map_err(|e| format_err!("could not read disk header for disk '{}'. Image must be a valid raw disk image: {}", image.to_string_lossy(), e))?;
 
     // now for regions
     let region_strs: Vec<_> = args.values_of("regions").unwrap().collect();
-    if region_strs.is_empty() {
-        println!("must specify one or more regions, or use the default of 'all'");
-        std::process::exit(1);
-    }
+    ensure!(!region_strs.is_empty(), "must specify one or more regions, or use the default of 'all'");
     // If we're given '--regions us-east-1,us-west-2', use the first argument as the first region
     // to uplaod to (the client region).
     // If we're not, upload to the first region based on the default region configured in the aws
     // profile / AWS_REGION env var.
     let mut initial_region = rusoto_core::region::Region::default();
     let resolved_regions = if region_strs[0] == "all" {
-        resolve_all_regions().await
-            .unwrap()
+        resolve_all_regions().await?
     } else {
         let rs = region_strs.into_iter().map(|r| {
             rusoto_core::region::Region::from_str(r)
                 .with_context(|| "could not parse region")
         }).collect::<Result<Vec<_>>>()
-            .with_context(|| format!("failed to parse region"))
-            .unwrap();
+            .with_context(|| format!("failed to parse region"))?;
         initial_region = rs[0].clone();
         rs
     };
@@ -129,21 +130,21 @@ async fn main() {
     let ebs_client = EbsClient::new(initial_region.clone());
     let uploader = SnapshotUploader::new(ebs_client);
     let snapshot_id = uploader.upload_from_file(&image, None, Some(&info.label), None)
-        .await
-        .expect("error uploading snapshot");
+        .await?;
     println!("uploading snapshot {}", snapshot_id);
 
     let ec2_client = Ec2Client::new(initial_region.clone());
     SnapshotWaiter::new(ec2_client)
         .wait_for_completed(&snapshot_id)
-        .await
-        .expect("error waiting for snapshot to complete");
+        .await?;
 
     // Snapshot done, make the AMI
     let ami_gbs = match args.value_of("root_size") {
-        Some(s) => s.parse().unwrap(),
+        Some(s) => s.parse().context("invalid root-size")?,
         None => {
-            info.logical_bytes / 1024 / 1024 / 1024
+            // bytes to gbs, but round up
+            let bytes_in_gb = 1024 * 1024 * 1024;
+            (info.logical_bytes + bytes_in_gb - 1) / bytes_in_gb
         },
     };
     let ec2_client = Ec2Client::new(initial_region.clone());
@@ -204,6 +205,7 @@ async fn main() {
         }).await.expect("could not copy ami to region");
         println!("copied ami to region {} as id {}", region.name(), resp.image_id.unwrap());
     }
+    Ok(())
 }
 
 async fn resolve_all_regions() -> Result<Vec<rusoto_core::region::Region>> {
