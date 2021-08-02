@@ -33,9 +33,15 @@ struct Opt {
     // print debug information to stderr
     #[structopt(long)]
     debug: bool,
+
+    // print progress bars to stderr
+    #[structopt(long)]
+    progress: Option<bool>,
+
     // regions to copy the AMI to, or 'all' for all of them.
     #[structopt(long, default_value = "all")]
-    regions: Vec<String>,
+    regions: String,
+
     // the root size of the AMI's ebs volume, in GBs. By default, this will be the same as the
     // image's size
     #[structopt(long)]
@@ -114,7 +120,7 @@ async fn main_() -> Result<()> {
     })?;
 
     // now for regions
-    let region_strs = args.regions;
+    let region_strs: Vec<_> = args.regions.split(",").collect();
     ensure!(
         !region_strs.is_empty(),
         "must specify one or more regions, or use the default of 'all'"
@@ -147,12 +153,21 @@ async fn main_() -> Result<()> {
     // upload time
     eprintln!("uploading snapshot to region {}", initial_region.name());
 
+    let progress_bar = match args.progress {
+        Some(true) => {
+            let p = indicatif::ProgressBar::new(50)
+                .with_prefix("snapshot upload");
+            Some(p)
+        },
+        _ => None,
+    };
     let ebs_client = EbsClient::new(initial_region.clone());
     let uploader = SnapshotUploader::new(ebs_client);
     let snapshot_id = uploader
-        .upload_from_file(&image, None, Some(&info.label), None)
+        .upload_from_file(&image, None, Some(&info.label), progress_bar)
         .await?;
 
+    eprintln!("waiting for snapshot upload to finalize");
     let ec2_client = Ec2Client::new(initial_region.clone());
     SnapshotWaiter::new(ec2_client)
         .wait_for_completed(&snapshot_id)
@@ -169,6 +184,7 @@ async fn main_() -> Result<()> {
     };
     let ec2_client = Ec2Client::new(initial_region.clone());
 
+    eprintln!("registering AMI in {}", initial_region.name());
     let ami_name = format!("NixOS-{}-{}", info.label, info.system);
     let resp = ec2_client
         .register_image(rusoto_ec2::RegisterImageRequest {
@@ -222,6 +238,13 @@ async fn main_() -> Result<()> {
         init_ami_id
     );
 
+    if copy_regions.is_empty() {
+        return Ok(())
+    }
+
+    let copy_progress = indicatif::ProgressBar::new(copy_regions.len() as u64)
+        .with_prefix("copying ami");
+
     for region in &copy_regions {
         let ec2_client = Ec2Client::new(region.clone());
         let resp = ec2_client
@@ -233,12 +256,14 @@ async fn main_() -> Result<()> {
             })
             .await
             .expect("could not copy ami to region");
-        eprintln!(
-            "copied ami to region {} as id {}",
-            region.name(),
-            resp.image_id.unwrap()
-        );
+        debug!("created AMI: {}, {}", region.name(), resp.image_id.unwrap());
+        copy_progress.inc(1);
     }
+    copy_progress.finish();
+    eprintln!("copied AMI to all regions");
+
+    // And finally, output
+
     Ok(())
 }
 
