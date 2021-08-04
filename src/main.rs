@@ -5,6 +5,7 @@
 // Used under the terms of the Apache-2.0 license, Copyright Amazon Inc
 
 use core::str::FromStr;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{ensure, format_err, Context, Result};
@@ -13,19 +14,8 @@ use log::debug;
 use rusoto_ebs::EbsClient;
 use rusoto_ec2::{Ec2, Ec2Client};
 use rusoto_ssm::{GetParametersByPathRequest, Ssm, SsmClient};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
-
-// ImageInfo is metadata provided by the nix image build scripts.
-// https://github.com/NixOS/nixpkgs/blob/bed52081e58807a23fcb2df38a3f865a2f37834e/nixos/maintainers/scripts/ec2/amazon-image.nix#L86-L92
-#[derive(Debug, Deserialize)]
-struct ImageInfo {
-    label: String,
-    system: String,
-    #[serde(deserialize_with = "de_string_to_u64")]
-    logical_bytes: u64,
-    file: PathBuf,
-}
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "nixos-ami-upload")]
@@ -50,11 +40,28 @@ struct Opt {
     // the output format, one of 'json' or 'nix'
     // AMIs in each region will be printed in this format to stdout on success.
     #[structopt(long, default_value = "json")]
-    output_format: String,
+    output_format: OutputFormat,
 
     // directory containing nixos ami and metadata
     #[structopt(name = "file")]
     ami_dir: String,
+}
+
+#[derive(Debug)]
+enum OutputFormat {
+    Json,
+    Nix,
+}
+
+impl FromStr for OutputFormat {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "json" => Ok(Self::Json),
+            "nix" => Ok(Self::Nix),
+            _ => Err(format!("invalid format '{}'; must be 'nix' or 'json'", s)),
+        }
+    }
 }
 
 // Converts a string with a number in it to a u64
@@ -65,6 +72,23 @@ where
     String::deserialize(d)?
         .parse()
         .map_err(serde::de::Error::custom)
+}
+
+#[derive(Default, Debug, Serialize)]
+struct Output {
+    // region -> ami ID
+    amis: HashMap<String, String>,
+}
+
+// ImageInfo is metadata provided by the nix image build scripts.
+// https://github.com/NixOS/nixpkgs/blob/bed52081e58807a23fcb2df38a3f865a2f37834e/nixos/maintainers/scripts/ec2/amazon-image.nix#L86-L92
+#[derive(Debug, Deserialize)]
+struct ImageInfo {
+    label: String,
+    system: String,
+    #[serde(deserialize_with = "de_string_to_u64")]
+    logical_bytes: u64,
+    file: PathBuf,
 }
 
 #[tokio::main]
@@ -155,10 +179,9 @@ async fn main_() -> Result<()> {
 
     let progress_bar = match args.progress {
         Some(true) => {
-            let p = indicatif::ProgressBar::new(50)
-                .with_prefix("snapshot upload");
+            let p = indicatif::ProgressBar::new(50).with_prefix("snapshot upload");
             Some(p)
-        },
+        }
         _ => None,
     };
     let ebs_client = EbsClient::new(initial_region.clone());
@@ -240,32 +263,40 @@ async fn main_() -> Result<()> {
         init_ami_id
     );
 
-    if copy_regions.is_empty() {
-        return Ok(())
-    }
+    let mut output = Output::default();
+    output
+        .amis
+        .insert(initial_region.name().to_string(), init_ami_id.clone());
 
-    let copy_progress = indicatif::ProgressBar::new(copy_regions.len() as u64)
-        .with_prefix("copying ami");
+    if !copy_regions.is_empty() {
+        let copy_progress =
+            indicatif::ProgressBar::new(copy_regions.len() as u64).with_prefix("copying ami");
 
-    for region in &copy_regions {
-        let ec2_client = Ec2Client::new(region.clone());
-        let resp = ec2_client
-            .copy_image(rusoto_ec2::CopyImageRequest {
-                name: ami_name.clone(),
-                source_image_id: init_ami_id.clone(),
-                source_region: initial_region.name().to_string(),
-                ..Default::default()
-            })
-            .await
-            .expect("could not copy ami to region");
-        debug!("created AMI: {}, {}", region.name(), resp.image_id.unwrap());
-        copy_progress.inc(1);
+        for region in &copy_regions {
+            let ec2_client = Ec2Client::new(region.clone());
+            let resp = ec2_client
+                .copy_image(rusoto_ec2::CopyImageRequest {
+                    name: ami_name.clone(),
+                    source_image_id: init_ami_id.clone(),
+                    source_region: initial_region.name().to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("could not copy ami to region");
+            let image_id = resp.image_id.unwrap();
+            debug!("created AMI: {}, {}", region.name(), image_id);
+            output.amis.insert(region.name().to_string(), image_id);
+            copy_progress.inc(1);
+        }
+        copy_progress.finish();
+        eprintln!("copied AMI to all regions");
     }
-    copy_progress.finish();
-    eprintln!("copied AMI to all regions");
 
     // And finally, output
-
+    match args.output_format {
+        OutputFormat::Json => println!("{}", serde_json::to_string(&output)?),
+        OutputFormat::Nix => panic!("TODO"),
+    };
     Ok(())
 }
 
