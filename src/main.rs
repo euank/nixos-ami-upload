@@ -50,7 +50,6 @@ struct Opt {
 #[derive(Debug)]
 enum OutputFormat {
     Json,
-    Nix,
 }
 
 impl FromStr for OutputFormat {
@@ -58,8 +57,7 @@ impl FromStr for OutputFormat {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "json" => Ok(Self::Json),
-            "nix" => Ok(Self::Nix),
-            _ => Err(format!("invalid format '{}'; must be 'nix' or 'json'", s)),
+            _ => Err(format!("invalid format '{}'; must be 'json'", s)),
         }
     }
 }
@@ -295,7 +293,6 @@ async fn main_() -> Result<()> {
     // And finally, output
     match args.output_format {
         OutputFormat::Json => println!("{}", serde_json::to_string(&output)?),
-        OutputFormat::Nix => panic!("TODO"),
     };
     Ok(())
 }
