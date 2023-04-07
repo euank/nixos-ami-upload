@@ -24,6 +24,9 @@ struct Opt {
     #[structopt(long)]
     debug: bool,
 
+    #[structopt(long)]
+    name: Option<String>,
+
     // print progress bars to stderr
     #[structopt(long)]
     progress: Option<bool>,
@@ -158,10 +161,10 @@ async fn main_() -> Result<()> {
         let rs = region_strs
             .into_iter()
             .map(|r| {
-                rusoto_core::region::Region::from_str(&r).with_context(|| "could not parse region")
+                rusoto_core::region::Region::from_str(r).with_context(|| "could not parse region")
             })
             .collect::<Result<Vec<_>>>()
-            .with_context(|| format!("failed to parse region"))?;
+            .with_context(|| "failed to parse region".to_string())?;
         initial_region = rs[0].clone();
         rs
     };
@@ -206,7 +209,8 @@ async fn main_() -> Result<()> {
     let ec2_client = Ec2Client::new(initial_region.clone());
 
     eprintln!("registering AMI in {}", initial_region.name());
-    let ami_name = format!("NixOS-{}-{}", info.label, info.system);
+    let nixos_name = format!("NixOS-{}-{}", info.label, info.system);
+    let ami_name = args.name.unwrap_or(nixos_name.clone());
     let resp = ec2_client
         .register_image(rusoto_ec2::RegisterImageRequest {
             name: ami_name.clone(),
@@ -255,6 +259,17 @@ async fn main_() -> Result<()> {
         .expect("could not register ami");
     let init_ami_id = resp.image_id.unwrap();
 
+    ec2_client.create_tags(rusoto_ec2::CreateTagsRequest{
+        resources: vec![init_ami_id.clone()],
+        tags: vec![
+            rusoto_ec2::Tag{
+                key: Some("NixOSName".to_string()),
+                value: Some(nixos_name.clone()),
+            },
+        ],
+        ..Default::default()
+    }).await?;
+
     eprintln!(
         "registered ami: region={},id={}",
         initial_region.name(),
@@ -284,6 +299,17 @@ async fn main_() -> Result<()> {
             let image_id = resp.image_id.unwrap();
             debug!("created AMI: {}, {}", region.name(), image_id);
             output.amis.insert(region.name().to_string(), image_id);
+
+            ec2_client.create_tags(rusoto_ec2::CreateTagsRequest{
+                resources: vec![init_ami_id.clone()],
+                tags: vec![
+                    rusoto_ec2::Tag{
+                        key: Some("NixOSName".to_string()),
+                        value: Some(nixos_name.clone()),
+                    },
+                ],
+                ..Default::default()
+            }).await?;
             copy_progress.inc(1);
         }
         copy_progress.finish();
