@@ -14,6 +14,29 @@ The actual snapshot uploading is done using [coldsnap](https://github.com/awslab
 2. Build the nix derivation in 1, such as with `nix-build -o ami my-custom-ami.nix` The output will have a `nix-support/image-info.json` file present if done correctly.
 3. Use this tool to upload that ami with `nixos-ami-upload /path/to/nix-build/result --regions us-west-2,us-west-1`.
 
+### Caching and idempotency
+
+The input must resolve to the root of a `/nix/store` output. The canonical store
+path identifies the image, and the effective root volume size is part of the
+cache match. Each created AMI is tagged with `NixStorePath`, and its default name
+includes the Nix store hash and effective root volume size.
+
+Before uploading, the tool searches every requested region for an owned AMI with
+the same store-path tag and volume size. A complete cache hit returns the existing
+AMI IDs without opening or uploading the raw image. On a partial hit, an existing
+AMI is used as the source for only the missing regional copies. Copy requests also
+use a deterministic EC2 client token. The command returns AMI IDs only after every
+requested AMI reaches the `available` state.
+
+`--name` controls the name used when an AMI must be created; it is not part of the
+cache identity. AMIs created by older versions are not cache hits unless they are
+given the corresponding `NixStorePath` tag.
+
+Concurrent first-time invocations can still upload more than one snapshot because
+the current snapshot uploader does not accept a caller-provided idempotency token.
+The cache-key-based default AMI name prevents both uploads from registering the
+same default AMI, but does not avoid the redundant transfer.
+
 ### Status
 
 At the time of writing, this is neither heavily tested, nor all that clean
