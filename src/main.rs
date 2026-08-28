@@ -17,6 +17,7 @@ use rusoto_ebs::EbsClient;
 use rusoto_ec2::{Ec2, Ec2Client};
 use rusoto_ssm::{GetParametersByPathRequest, Ssm, SsmClient};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use structopt::StructOpt;
 
 const NIX_STORE_PATH_TAG: &str = "NixStorePath";
@@ -187,7 +188,7 @@ async fn main_() -> Result<()> {
 
     debug!("uploading to regions: {:?}", resolved_regions);
     let nixos_name = format!("NixOS-{}-{}", info.label, info.system);
-    let default_ami_name = ami_name_for_store_path(&nixos_name, &store_hash);
+    let default_ami_name = ami_name_for_store_path(&nixos_name, &store_hash, ami_gbs);
     let requested_ami_name = args.name.unwrap_or(default_ami_name);
     let mut output = Output::default();
     let cache_results = try_join_all(resolved_regions.iter().cloned().map(|region| {
@@ -216,6 +217,7 @@ async fn main_() -> Result<()> {
     }
 
     if output.amis.len() == resolved_regions.len() {
+        wait_for_output_amis(&output, &resolved_regions).await?;
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
@@ -301,7 +303,12 @@ async fn main_() -> Result<()> {
                     name: ami_name.clone(),
                     source_image_id: source_ami_id.clone(),
                     source_region: source_region.name().to_string(),
-                    client_token: Some(format!("nau-{}-{}", store_hash, ami_gbs)),
+                    client_token: Some(copy_client_token(
+                        &ami_name,
+                        &source_ami_id,
+                        source_region.name(),
+                        region.name(),
+                    )),
                     ..Default::default()
                 })
                 .await
@@ -315,8 +322,11 @@ async fn main_() -> Result<()> {
             copy_progress.inc(1);
         }
         copy_progress.finish();
-        eprintln!("copied AMI to all regions");
+        eprintln!("started AMI copies in all requested regions");
     }
+
+    wait_for_output_amis(&output, &resolved_regions).await?;
+    eprintln!("all AMIs are available");
 
     // And finally, output
     match args.output_format {
@@ -359,14 +369,28 @@ fn nix_store_identity(path: &Path) -> Result<(String, String)> {
     Ok((store_path, store_hash.to_string()))
 }
 
-fn ami_name_for_store_path(nixos_name: &str, store_hash: &str) -> String {
-    let suffix = format!("-{}", store_hash);
+fn ami_name_for_store_path(nixos_name: &str, store_hash: &str, ami_gbs: u64) -> String {
+    let suffix = format!("-{}-{}gb", store_hash, ami_gbs);
     let max_prefix_bytes = 128 - suffix.len();
     let mut prefix_end = nixos_name.len().min(max_prefix_bytes);
     while !nixos_name.is_char_boundary(prefix_end) {
         prefix_end -= 1;
     }
     format!("{}{}", &nixos_name[..prefix_end], suffix)
+}
+
+fn copy_client_token(
+    ami_name: &str,
+    source_ami_id: &str,
+    source_region: &str,
+    destination_region: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [ami_name, source_ami_id, source_region, destination_region] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("nau-{:x}", hasher.finalize())
 }
 
 fn register_image_request(
@@ -515,6 +539,23 @@ async fn wait_for_ami_available(client: &Ec2Client, image_id: &str) -> Result<()
     ))
 }
 
+async fn wait_for_output_amis(
+    output: &Output,
+    regions: &[rusoto_core::region::Region],
+) -> Result<()> {
+    try_join_all(regions.iter().map(|region| async move {
+        let image_id = output
+            .amis
+            .get(region.name())
+            .with_context(|| format!("no AMI was created for region {}", region.name()))?;
+        wait_for_ami_available(&Ec2Client::new(region.clone()), image_id)
+            .await
+            .with_context(|| format!("AMI {} in {} is not available", image_id, region.name()))
+    }))
+    .await?;
+    Ok(())
+}
+
 async fn resolve_all_regions() -> Result<Vec<rusoto_core::region::Region>> {
     let ssm_client = SsmClient::new(rusoto_core::region::Region::default());
     let mut next_token: Option<String> = None;
@@ -548,7 +589,7 @@ async fn resolve_all_regions() -> Result<Vec<rusoto_core::region::Region>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ami_name_for_store_path, nix_store_identity};
+    use super::{ami_name_for_store_path, copy_client_token, nix_store_identity};
     use std::path::Path;
 
     const STORE_HASH: &str = "0123456789abcdfghijklmnpqrsvwxyz";
@@ -573,16 +614,49 @@ mod tests {
     }
 
     #[test]
-    fn generated_ami_name_contains_hash_and_fits_aws_limit() {
-        let name = ami_name_for_store_path(&"a".repeat(200), STORE_HASH);
+    fn generated_ami_name_contains_cache_identity_and_fits_aws_limit() {
+        let name = ami_name_for_store_path(&"a".repeat(200), STORE_HASH, 16);
         assert_eq!(name.len(), 128);
-        assert!(name.ends_with(STORE_HASH));
+        assert!(name.ends_with(&format!("{}-16gb", STORE_HASH)));
     }
 
     #[test]
     fn generated_ami_name_truncates_on_a_character_boundary() {
-        let name = ami_name_for_store_path(&"界".repeat(100), STORE_HASH);
+        let name = ami_name_for_store_path(&"界".repeat(100), STORE_HASH, 16);
         assert!(name.len() <= 128);
-        assert!(name.ends_with(STORE_HASH));
+        assert!(name.ends_with(&format!("{}-16gb", STORE_HASH)));
+    }
+
+    #[test]
+    fn generated_ami_names_differ_by_root_volume_size() {
+        let small = ami_name_for_store_path("NixOS-test", STORE_HASH, 16);
+        let large = ami_name_for_store_path("NixOS-test", STORE_HASH, 100);
+        assert_ne!(small, large);
+    }
+
+    #[test]
+    fn copy_tokens_cover_material_request_context() {
+        let token = copy_client_token("ami-name", "ami-source", "us-east-1", "us-west-1");
+        assert_eq!(
+            token,
+            copy_client_token("ami-name", "ami-source", "us-east-1", "us-west-1")
+        );
+        assert_ne!(
+            token,
+            copy_client_token("other-name", "ami-source", "us-east-1", "us-west-1")
+        );
+        assert_ne!(
+            token,
+            copy_client_token("ami-name", "ami-other", "us-east-1", "us-west-1")
+        );
+        assert_ne!(
+            token,
+            copy_client_token("ami-name", "ami-source", "eu-west-1", "us-west-1")
+        );
+        assert_ne!(
+            token,
+            copy_client_token("ami-name", "ami-source", "us-east-1", "us-west-2")
+        );
+        assert!(token.len() <= 128);
     }
 }

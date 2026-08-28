@@ -724,6 +724,7 @@ dependencies = [
  "rusoto_ssm",
  "serde",
  "serde_json",
+ "sha2",
  "snafu",
  "structopt",
  "tokio",
